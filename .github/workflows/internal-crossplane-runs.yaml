@@ -1,0 +1,98 @@
+name: Lightweight Crossplane Runs
+
+on:
+  workflow_dispatch:
+
+jobs:
+  crossplane-ops:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Install kind
+        uses: helm/kind-action@v1.9.0
+
+      - name: Create kind cluster
+        run: |
+          kind create cluster --name test
+
+      - name: Set kubectl context
+        run: kubectl config use-context kind-test
+
+      - name: Echo node architecture
+        run: kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}'
+
+      - name: Install Crossplane in cluster
+        run: |
+          kubectl create namespace crossplane-system --dry-run=client -o yaml | kubectl apply -f -
+          helm repo add crossplane-stable https://charts.crossplane.io/stable
+          helm repo update
+          helm install crossplane crossplane-stable/crossplane --namespace crossplane-system --create-namespace
+
+      - name: Wait for Crossplane to get healthy
+        run: kubectl wait --for=condition=Available --timeout=300s deployment/crossplane -n crossplane-system
+
+      - name: Echo Crossplane status
+        run: kubectl get pods -n crossplane-system
+
+      - name: Install Networking Provider
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: pkg.crossplane.io/v1
+          kind: Provider
+          metadata:
+            name: provider-oci-networking
+          spec:
+            package: ghcr.io/oracle/provider-oci-networking:v0.0.2
+          EOF
+
+      - name: Wait for Provider to be healthy
+        run: kubectl wait --for=condition=Healthy --timeout=300s provider.pkg.crossplane.io/provider-oci-networking
+
+      - name: Echo installed providers
+        run: |
+          kubectl get providers
+
+      - name: Apply OCI Creds Secret
+        run: |
+          kubectl apply -f workflow-config/secret.yaml
+
+      - name: Apply Provider Config
+        run: |
+          kubectl apply -f workflow-config/provider_config.yaml
+
+      - name: Get Providers for Debug
+        run: kubectl get providers
+
+      - name: Describe Providers for Debug
+        run: kubectl describe providers
+
+      - name: Apply VCN YAML
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: networking.oci.upbound.io/v1alpha1
+          kind: Vcn
+          metadata:
+            name: vdittaka-vcn-xp
+          spec:
+            forProvider:
+              compartmentId: "ocid1.compartment.oc1..aaaaaaaac4qhiyti5nwofgw7clrkxyo35umcjtztolrmc2tshwvvb7kng26a"
+              displayName: vdittaka-vcn-xp
+              cidrBlocks:
+                - "10.1.0.0/16"
+            providerConfigRef:
+              name: default
+          EOF
+
+      - name: Wait for Managed Resource to be ready
+        run: kubectl wait --for=condition=Ready --timeout=300s vcn.networking.oci.upbound.io/vdittaka-vcn-xp
+
+      - name: Get Managed Resources for Debug
+        run: kubectl get managed
+
+      - name: Describe Managed Resources for Debug
+        run: kubectl describe managed

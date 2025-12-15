@@ -5,7 +5,7 @@ on:
     types: [created]
 
 jobs:
-  run-crossplane-setup:
+  establish-oci-auth:
     environment: OCI_CLI
     if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/run-examples ')
     runs-on: ubuntu-latest
@@ -74,6 +74,25 @@ jobs:
             fi
           fi
 
+      - name: Upload OCI Config Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-config
+          path: $HOME/.oci/
+
+  crossplane-ops:
+    needs: establish-oci-auth
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download OCI Config
+        uses: actions/download-artifact@v4
+        with:
+          name: oci-config
+          path: $HOME/.oci/
+
       - name: Install kubectl
         uses: azure/setup-kubectl@v3
 
@@ -98,11 +117,11 @@ jobs:
           helm install crossplane crossplane-stable/crossplane --namespace crossplane-system --create-namespace
 
       - name: Wait for Crossplane to get healthy
-        run: sleep 30
+        run: kubectl wait --for=condition=Available --timeout=300s deployment/crossplane -n crossplane-system
 
       - name: Echo Crossplane status
         run: kubectl get pods -n crossplane-system
-        
+
       - name: Apply Deployment Runtime Config
         run: |
           kubectl apply -f workflow-config/deployment_runtime_config.yaml
@@ -118,8 +137,8 @@ jobs:
             package: ghcr.io/oracle/provider-oci-networking:v0.0.2
           EOF
 
-      - name: Wait for Providers to Appear
-        run: sleep 30
+      - name: Wait for Provider to be healthy
+        run: kubectl wait --for=condition=Healthy --timeout=300s provider.pkg.crossplane.io/provider-oci-networking
 
       - name: Echo installed providers
         run: |
@@ -127,13 +146,7 @@ jobs:
 
       - name: Apply OCI Creds Secret
         run: |
-          kubectl apply -f workflow-config/secret.yaml
-
-      - name: Wait for ProviderConfig CRD
-        run: |
-          for i in $(seq 1 30); do
-            kubectl get crds providerconfigs.oci.upbound.io && break || sleep 5
-          done
+          kubectl apply -f workflow-config/external_secret.yaml
 
       - name: Apply Provider Config
         run: |
@@ -162,8 +175,8 @@ jobs:
               name: default
           EOF
 
-      - name: Wait for Managed Resource to Appear
-        run: sleep 30
+      - name: Wait for Managed Resource to be ready
+        run: kubectl wait --for=condition=Ready --timeout=300s vcn.networking.oci.upbound.io/vdittaka-vcn-xp
 
       - name: Get Managed Resources for Debug
         run: kubectl get managed
