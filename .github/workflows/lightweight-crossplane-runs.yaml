@@ -1,0 +1,172 @@
+name: Lightweight Crossplane Runs
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  run-crossplane-setup:
+    environment: OCI_CLI
+    if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/run-examples ')
+    runs-on: ubuntu-latest
+    outputs:
+      yamls: ${{ steps.extract.outputs.yamls }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract yamls
+        id: extract
+        run: |
+          COMMENT="${{ github.event.comment.body }}"
+          YAMLS=$(echo "$COMMENT" | sed 's|^/run-examples ||')
+          echo "yamls=$YAMLS" >> $GITHUB_OUTPUT
+
+      - name: Write Config & Key Files
+        run: |
+          mkdir -p $HOME/.oci/sessions/DEFAULT
+          echo "[DEFAULT]" >> $HOME/.oci/config
+          echo "fingerprint=${{ secrets.OCI_CLI_FINGERPRINT }}" >> $HOME/.oci/config
+          echo "key_file=$HOME/.oci/sessions/DEFAULT/oci_api_key.pem" >> $HOME/.oci/config
+          echo "tenancy=${{ secrets.OCI_CLI_TENANCY }}" >> $HOME/.oci/config
+          echo "region=${{ vars.OCI_CLI_REGION }}" >> $HOME/.oci/config
+          echo "security_token_file=$HOME/.oci/sessions/DEFAULT/token" >> $HOME/.oci/config
+          echo "${{ secrets.OCI_CLI_KEY_CONTENT }}" >> $HOME/.oci/sessions/DEFAULT/oci_api_key.pem
+          echo "${{ secrets.OCI_CLI_SECURITY_TOKEN }}" >> $HOME/.oci/sessions/DEFAULT/token
+
+      - name: Trim Trailing Newline from Token
+        run: |
+          head -c -1 $HOME/.oci/sessions/DEFAULT/token > $HOME/.oci/sessions/DEFAULT/token.tmp
+          mv $HOME/.oci/sessions/DEFAULT/token.tmp $HOME/.oci/sessions/DEFAULT/token
+
+      - name: Echo OCI Config for Debug
+        run: cat $HOME/.oci/config
+
+      - name: Echo Token count for Debug
+        run: wc -c $HOME/.oci/sessions/DEFAULT/token
+
+      - name: Install OCI CLI
+        run: |
+          curl -L -O https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh
+          chmod +x install.sh
+          ./install.sh --accept-all-defaults
+
+      - name: Fix Config File Permissions
+        run: |
+          export PATH="$PATH:$HOME/bin"
+          oci setup repair-file-permissions --file $HOME/.oci/sessions/DEFAULT/oci_api_key.pem
+          oci setup repair-file-permissions --file $HOME/.oci/config
+
+      - name: Validate OCI Session
+        run: |
+          export PATH="$PATH:$HOME/bin"
+          output="$(oci session validate --local 2>&1)"
+          result=$?
+          echo "$output"
+          if [ $result -eq 0 ]; then
+            echo "OCI session validation succeeded."
+          else
+            if echo "$output" | grep -q "Session is valid until"; then
+              echo "WARNING: OCI session validate returned an error but output indicates session is valid. Continuing workflow."
+            else
+              echo "OCI session has expired or failed - please check session token secrets"
+              exit 1
+            fi
+          fi
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Install kind
+        uses: helm/kind-action@v1.9.0
+
+      - name: Create kind cluster
+        run: |
+          kind create cluster --name test
+
+      - name: Set kubectl context
+        run: kubectl config use-context kind-test
+
+      - name: Echo node architecture
+        run: kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.architecture}'
+
+      - name: Install Crossplane in cluster
+        run: |
+          kubectl create namespace crossplane-system --dry-run=client -o yaml | kubectl apply -f -
+          helm repo add crossplane-stable https://charts.crossplane.io/stable
+          helm repo update
+          helm install crossplane crossplane-stable/crossplane --namespace crossplane-system --create-namespace
+
+      - name: Wait for Crossplane to get healthy
+        run: sleep 30
+
+      - name: Echo Crossplane status
+        run: kubectl get pods -n crossplane-system
+        
+      - name: Apply Deployment Runtime Config
+        run: |
+          kubectl apply -f workflow-config/deployment_runtime_config.yaml
+
+      - name: Install Networking Provider
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: pkg.crossplane.io/v1
+          kind: Provider
+          metadata:
+            name: provider-oci-networking
+          spec:
+            package: ghcr.io/oracle/provider-oci-networking:v0.0.2
+          EOF
+
+      - name: Wait for Providers to Appear
+        run: sleep 30
+
+      - name: Echo installed providers
+        run: |
+          kubectl get providers
+
+      - name: Apply OCI Creds Secret
+        run: |
+          kubectl apply -f workflow-config/secret.yaml
+
+      - name: Wait for ProviderConfig CRD
+        run: |
+          for i in $(seq 1 30); do
+            kubectl get crds providerconfigs.oci.upbound.io && break || sleep 5
+          done
+
+      - name: Apply Provider Config
+        run: |
+          kubectl apply -f workflow-config/provider_config.yaml
+
+      - name: Get Providers for Debug
+        run: kubectl get providers
+
+      - name: Describe Providers for Debug
+        run: kubectl describe providers
+
+      - name: Apply VCN YAML
+        run: |
+          cat <<EOF | kubectl apply -f -
+          apiVersion: networking.oci.upbound.io/v1alpha1
+          kind: Vcn
+          metadata:
+            name: vdittaka-vcn-xp
+          spec:
+            forProvider:
+              compartmentId: "ocid1.compartment.oc1..aaaaaaaac4qhiyti5nwofgw7clrkxyo35umcjtztolrmc2tshwvvb7kng26a"
+              displayName: vdittaka-vcn-xp
+              cidrBlocks:
+                - "10.1.0.0/16"
+            providerConfigRef:
+              name: default
+          EOF
+
+      - name: Wait for Managed Resource to Appear
+        run: sleep 30
+
+      - name: Get Managed Resources for Debug
+        run: kubectl get managed
+
+      - name: Describe Managed Resources for Debug
+        run: kubectl describe managed

@@ -1,0 +1,31 @@
+apiVersion: pkg.crossplane.io/v1beta1
+kind: DeploymentRuntimeConfig
+metadata:
+  name: default
+spec:
+  deploymentTemplate:
+    spec:
+      selector: {}
+      template:
+        spec:
+          volumes:
+            - name: session-token-volume
+              hostPath:
+                path: $HOME/.oci
+                type: Directory
+          containers:
+            - command:
+                - /usr/local/bin/provider
+                - --debug
+              name: package-runtime
+              volumeMounts:
+                - name: session-token-volume
+                  mountPath: $HOME/.oci
+                  readOnly: true
+              resources:
+                limits:
+                  cpu: 2000m
+                  memory: 2Gi
+                requests:
+                  cpu: 500m
+                  memory: 512Mi
