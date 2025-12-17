@@ -1,0 +1,182 @@
+version: 0.1
+component: build
+timeoutInSeconds: 360
+shell: bash
+
+steps:
+  - type: Command
+    name: "Install sudo for minikube to contain podman"
+    timeoutInSeconds: 600
+    command: |
+      yum update -y
+      yum install -y sudo
+
+  - type: Command
+    name: "Configure passwordless sudo for podman"
+    timeoutInSeconds: 60
+    command: |
+      USERNAME=$(whoami)
+      LINE="$USERNAME ALL=(ALL) NOPASSWD: /usr/bin/podman"
+      FILE=/etc/sudoers.d/podman_nopasswd
+      if ! grep -Fxq "$LINE" $FILE 2>/dev/null; then
+        echo "$LINE" > $FILE
+        chmod 0440 $FILE
+      fi
+      visudo -cf $FILE
+      sudo -k -n podman version
+
+  - type: Command
+    name: "Set SELinux to permissive"
+    timeoutInSeconds: 30
+    command: |
+      if command -v getenforce; then
+        mode=$(getenforce)
+        echo "SELinux mode: $mode"
+        if [ "$mode" = "Enforcing" ]; then
+          setenforce 0
+        fi
+      else
+        echo "getenforce not found; SELinux may not be installed."
+      fi
+
+  - type: Command
+    name: "Podman Info"
+    timeoutInSeconds: 60
+    command: |
+      podman info
+
+  - type: Command
+    name: "Disable firewall"
+    timeoutInSeconds: 60
+    command: |
+      if systemctl is-active --quiet firewalld; then
+        systemctl stop firewalld
+      fi
+      systemctl disable firewalld || true
+
+  ##########################################################################################
+  - type: Command
+    name: "Install minikube"
+    timeoutInSeconds: 300
+    command: |
+      cd ~
+      curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+      install minikube-linux-amd64 /usr/local/bin/minikube && rm minikube-linux-amd64
+      mv /usr/local/bin/minikube /usr/bin/minikube
+      minikube version
+
+  - type: Command
+    name: "Install helm"
+    timeoutInSeconds: 300
+    command: |
+      curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+  ##########################################################################################
+  - type: Command
+    name: "Cleanup previous minikube artifacts"
+    timeoutInSeconds: 120
+    command: |
+      minikube delete --all || true
+      podman system prune --force || true
+      podman volume rm -f minikube || true
+
+  - type: Command
+    name: "Ensure containers.conf netns/utsns private"
+    timeoutInSeconds: 60
+    command: |
+      if [ -f /etc/containers/containers.conf ]; then
+        sed -i 's/^\(netns *= *\).*$/\1"private"/' /etc/containers/containers.conf
+        sed -i 's/^\(utsns *= *\).*$/\1"private"/' /etc/containers/containers.conf
+      fi
+
+  - type: Command
+    name: "Start minikube with podman"
+    timeoutInSeconds: 600
+    command: |
+      minikube start --driver=podman --container-runtime=cri-o --force --alsologtostderr -v=7
+
+  - type: Command
+    name: "Alias kubectl to minikube"
+    timeoutInSeconds: 30
+    command: |
+      echo 'alias kubectl="minikube kubectl --"' >> ~/.bashrc
+      source ~/.bashrc
+
+  - type: Command
+    name: "Install Crossplane in cluster"
+    timeoutInSeconds: 600
+    command: |
+      kubectl create namespace crossplane-system --dry-run=client -o yaml | kubectl apply -f -
+      helm repo add crossplane-stable https://charts.crossplane.io/stable
+      helm repo update
+      helm install crossplane crossplane-stable/crossplane --namespace crossplane-system --create-namespace
+
+  - type: Command
+    name: "Wait for Crossplane to get healthy"
+    timeoutInSeconds: 300
+    command: |
+      kubectl wait --for=condition=Available --timeout=300s deployment/crossplane -n crossplane-system
+
+  ##########################################################################################
+  - type: Command
+    name: "Install Networking Provider"
+    timeoutInSeconds: 300
+    command: |
+      kubectl apply -f - <<EOF
+      apiVersion: pkg.crossplane.io/v1
+      kind: Provider
+      metadata:
+        name: provider-oci-networking
+      spec:
+        package: ghcr.io/oracle/provider-oci-networking:v0.0.2
+      EOF
+
+  - type: Command
+    name: "Wait for Provider to be healthy"
+    timeoutInSeconds: 300
+    command: |
+      kubectl wait --for=condition=Healthy --timeout=300s provider.pkg.crossplane.io/provider-oci-networking
+
+  - type: Command
+    name: "Apply OCI Creds Secret"
+    timeoutInSeconds: 120
+    command: |
+      kubectl apply -f ${OCI_PRIMARY_SOURCE_DIR}/workflow-config/secret.yaml
+
+  - type: Command
+    name: "Apply Provider Config"
+    timeoutInSeconds: 120
+    command: |
+      kubectl apply -f ${OCI_PRIMARY_SOURCE_DIR}/workflow-config/provider_config.yaml
+
+  - type: Command
+    name: "Apply VCN YAML"
+    timeoutInSeconds: 300
+    command: |
+      kubectl apply -f - <<EOF
+      apiVersion: networking.oci.upbound.io/v1alpha1
+      kind: Vcn
+      metadata:
+        name: vdittaka-vcn-xp
+      spec:
+        forProvider:
+          compartmentId: "ocid1.compartment.oc1..aaaaaaaac4qhiyti5nwofgw7clrkxyo35umcjtztolrmc2tshwvvb7kng26a"
+          displayName: vdittaka-vcn-xp
+          cidrBlocks:
+            - "10.1.0.0/16"
+        providerConfigRef:
+          name: default
+      EOF
+
+  - type: Command
+    name: "Wait for Managed Resource to be ready"
+    timeoutInSeconds: 300
+    command: |
+      kubectl wait --for=condition=Ready --timeout=300s vcn.networking.oci.upbound.io/vdittaka-vcn-xp
+
+  ##########################################################################################
+  - type: Command
+    name: "Delete minikube cluster"
+    timeoutInSeconds: 300
+    command: |
+      minikube delete
