@@ -5,12 +5,10 @@ on:
     types: [created]
 
 jobs:
-  establish-oci-auth:
+  crossplane-ops:
     environment: OCI_CLI
     if: github.event.issue.pull_request && startsWith(github.event.comment.body, '/run-examples ')
     runs-on: ubuntu-latest
-    outputs:
-      yamls: ${{ steps.extract.outputs.yamls }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -73,25 +71,6 @@ jobs:
               exit 1
             fi
           fi
-
-      - name: Upload OCI Config Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: oci-config
-          path: $HOME/.oci/
-
-  crossplane-ops:
-    needs: establish-oci-auth
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download OCI Config
-        uses: actions/download-artifact@v4
-        with:
-          name: oci-config
-          path: $HOME/.oci/
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v3
@@ -156,6 +135,7 @@ jobs:
         run: kubectl get providers
 
       - name: Describe Providers for Debug
+        if: always()
         run: kubectl describe providers
 
       - name: Apply VCN YAML
@@ -183,3 +163,24 @@ jobs:
 
       - name: Describe Managed Resources for Debug
         run: kubectl describe managed
+
+      - name: Collect provider-oci logs
+        if: always()
+        run: |
+          PODS=$(kubectl get pods -n crossplane-system -o name | grep provider-oci- || true)
+          if [ -n "$PODS" ]; then
+            for pod in $PODS; do
+              echo "==== $pod ====" >> provider-logs.txt
+              kubectl logs -n crossplane-system $(basename $pod) >> provider-logs.txt 2>&1
+              echo "" >> provider-logs.txt
+            done
+          else
+            echo "No provider-oci pods found." > provider-logs.txt
+          fi
+
+      - name: Upload provider pod logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: provider-oci-logs
+          path: provider-logs.txt
