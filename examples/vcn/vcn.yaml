@@ -1,10 +1,12 @@
-apiVersion: core.oci.upbound.io/v1alpha1
+apiVersion: networking.oci.upbound.io/v1alpha1
 kind: Vcn
 metadata:
-  name: vcn-via-crossplane5
+  name: vdittaka-vcn-xp
 spec:
   forProvider:
-    compartmentIdRef: 
-      name : compartment-via-crossplane1
-    displayName: vcn-via-crossplane
-    cidrBlocks: ["10.20.20.0/29"]
+    compartmentId: "ocid1.compartment.oc1..aaaaaaaac4qhiyti5nwofgw7clrkxyo35umcjtztolrmc2tshwvvb7kng26a"
+    displayName: vdittaka-vcn-xp
+    cidrBlocks:
+      - "10.1.0.0/16"
+  providerConfigRef:
+    name: default
